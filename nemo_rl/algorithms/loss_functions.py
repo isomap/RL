@@ -23,6 +23,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
     ChunkedDistributedEntropy,
     ChunkedDistributedGatherLogprob,
+    _compute_distributed_log_softmax,
     _get_tokens_on_this_cp_rank,
     allgather_cp_sharded_tensor,
     from_parallel_logits_to_logprobs,
@@ -962,6 +963,232 @@ class SequencePackingLossWrapper:
                     metrics_accum[k] += val
 
         return loss_accum, metrics_accum
+
+
+class _DistributedForwardKL(torch.autograd.Function):
+    """Compute forward KL divergence D_KL(teacher || student) across TP-sharded vocab.
+
+    Forward computes distributed log-softmax for both teacher and student,
+    then returns per-token KL. Backward propagates only through student logits.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx: Any,
+        student_logits: torch.Tensor,  # [B, S, V_local] — needs grad
+        teacher_logits: torch.Tensor,  # [B, S, V_local] — detached
+        tp_group: torch.distributed.ProcessGroup,
+    ) -> torch.Tensor:
+        # Distributed log-softmax across full vocab (no_grad helper is fine here)
+        teacher_log_probs = _compute_distributed_log_softmax(
+            teacher_logits, group=tp_group
+        )
+        student_log_probs = _compute_distributed_log_softmax(
+            student_logits, group=tp_group
+        )
+        teacher_probs = teacher_log_probs.exp()  # [B, S, V_local]
+        student_probs = student_log_probs.exp()  # [B, S, V_local]
+
+        # Forward KL (local shard): sum_v p_v * (log p_v - log q_v)
+        local_kl = (teacher_probs * (teacher_log_probs - student_log_probs)).sum(dim=-1)
+        # Sum across TP ranks to get global per-token KL
+        torch.distributed.all_reduce(
+            local_kl, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+
+        # Save for backward (only need local probs on this rank)
+        ctx.save_for_backward(teacher_probs, student_probs)
+        ctx.tp_group = tp_group
+
+        return local_kl.contiguous()  # [B, S]
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None]:
+        grad_output = grad_outputs[0]  # [B, S]
+        teacher_probs, student_probs = ctx.saved_tensors  # [B, S, V_local] each
+
+        # d(KL)/d(z_v) = q_v - p_v  (purely local, no TP communication)
+        grad_student = (student_probs - teacher_probs) * grad_output.unsqueeze(-1)
+        return grad_student, None, None
+
+
+class SpecDecLossWrapper:
+    """Wraps a policy loss function to jointly compute speculative decoding (Eagle) loss.
+
+    The specdec model produces logits that should match the policy model's next-token
+    distribution. We optimise via forward KL divergence D_KL(teacher || student) where:
+      - teacher = policy model logits (detached — no Eagle gradients flow to policy)
+      - student = specdec model logits (receives gradients)
+
+    Supports both non-distributed and TP-sharded vocab logits.
+    """
+
+    def __init__(
+        self,
+        loss_fn: LossFunction,
+        specdec_model: torch.nn.Module,
+        captured_hidden_states: torch.Tensor,  # detached, on GPU [S, B, H*num_aux]
+        captured_inputs_embeds: torch.Tensor,  # detached, on GPU [S, B, H]
+        loss_weight: float = 1.0,
+        sequence_parallel: bool = False,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_padded: Optional[torch.Tensor] = None,
+    ):
+        self.loss_fn = loss_fn
+        self.specdec_model = specdec_model
+        self.captured_hidden_states = captured_hidden_states
+        self.captured_inputs_embeds = captured_inputs_embeds
+        self.loss_weight = loss_weight
+        self.sequence_parallel = sequence_parallel
+        self.cu_seqlens = cu_seqlens
+        self.cu_seqlens_padded = (
+            cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        )
+
+    def _build_packed_kl_mask(
+        self,
+        data: BatchedDataDict[Any],
+        kl_seq_len: int,
+        context_parallel_group,
+    ) -> torch.Tensor:
+        """Build a ``[1, kl_seq_len]`` mask for the specdec KL loss over packed sequences.
+
+        Handles three concerns that arise from sequence packing:
+          1. Mapping each sequence's ``token_mask`` (and optional ``sample_mask``)
+             into the correct positions of the flat packed tensor.
+          2. Applying the next-token shift (logit at position *t* predicts token
+             *t + 1*, so the mask is shifted by one).
+          3. Zeroing out cross-boundary positions where the logit from the last
+             position of sequence *i* would otherwise be evaluated against the
+             first token of sequence *i + 1*.
+        """
+        cu_seqlens = self.cu_seqlens
+        cu_seqlens_padded = self.cu_seqlens_padded
+
+        cp_size = (
+            1
+            if context_parallel_group is None
+            else torch.distributed.get_world_size(context_parallel_group)
+        )
+
+        device = data["token_mask"].device
+        num_seqs = len(cu_seqlens) - 1
+        # total_len is the pre-truncation packed length (on this CP rank)
+        total_len = kl_seq_len + 1
+
+        # Step 1: scatter per-sequence token_mask (× sample_mask) into packed positions
+        packed_mask = torch.zeros(1, total_len, device=device)
+        for i in range(num_seqs):
+            padded_start = cu_seqlens_padded[i].item() // cp_size
+            unpadded_len = (cu_seqlens[i + 1].item() - cu_seqlens[i].item()) // cp_size
+            seq_mask = data["token_mask"][i, :unpadded_len].to(packed_mask.dtype)
+            if "sample_mask" in data:
+                seq_mask = seq_mask * data["sample_mask"][i]
+            packed_mask[0, padded_start : padded_start + unpadded_len] = seq_mask
+
+        # Step 2: next-token shift — mask[j] corresponds to logit[j] predicting token[j+1]
+        kl_mask = packed_mask[:, 1:]  # [1, kl_seq_len]
+
+        # Step 3: zero out cross-boundary positions (last padded position of each seq
+        # would predict the first token of the next seq — meaningless across sequences)
+        for i in range(1, num_seqs + 1):
+            boundary = cu_seqlens_padded[i].item() // cp_size
+            if 0 < boundary <= kl_seq_len:
+                kl_mask[0, boundary - 1] = 0
+
+        return kl_mask
+
+    def __call__(
+        self,
+        next_token_logits,  # [B, S, V] from GPTModel (or [1, T, V] if packed)
+        data,
+        global_valid_seqs,
+        global_valid_toks,
+        vocab_parallel_rank=None,
+        vocab_parallel_group=None,
+        context_parallel_group=None,
+    ):
+        # ── 1. Compute policy loss (pass through to wrapped loss_fn) ──
+        policy_loss, metrics = self.loss_fn(
+            next_token_logits,
+            data,
+            global_valid_seqs,
+            global_valid_toks,
+            vocab_parallel_rank=vocab_parallel_rank,
+            vocab_parallel_group=vocab_parallel_group,
+            context_parallel_group=context_parallel_group,
+        )
+
+        # ── 2. Prepare specdec inputs ──
+        hs = self.captured_hidden_states  # already detached
+        ie = self.captured_inputs_embeds  # already detached
+
+        # # Gather from sequence-parallel region if needed
+        # if self.sequence_parallel:
+        #     from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+        #     hs = gather_from_sequence_parallel_region(hs)
+        #     ie = gather_from_sequence_parallel_region(ie)
+
+        # ── 3. Get specdec model logits (inputs already in Megatron [S, B, H]) ──
+        specdec_logits = self.specdec_model(
+            hidden_states=hs,
+            input_embeds=ie,
+        )
+
+        # ── 4. Compute forward KL(teacher=policy || student=specdec) ──
+        # Teacher logits are detached so Eagle gradients don't flow into the policy.
+        teacher_logits = next_token_logits.detach().to(torch.float32)
+        student_logits = specdec_logits.to(torch.float32)
+
+        # Next-token alignment: logits at position t predict token t+1.
+        # Drop last logit position; align mask by dropping first position.
+        teacher_logits = teacher_logits[:, :-1, :]
+        student_logits = student_logits[:, :-1, :]
+
+        kl_seq_len = teacher_logits.shape[1]
+
+        if self.cu_seqlens is not None:
+            # Packed sequences: build mask from per-sequence token_masks
+            mask = self._build_packed_kl_mask(data, kl_seq_len, context_parallel_group)
+        else:
+            # Standard batched path
+            token_mask = data["token_mask"][:, 1:]  # [B, S-1]
+            token_mask = token_mask[:, :kl_seq_len]  # align to logit length
+            if "sample_mask" in data:
+                mask = token_mask * data["sample_mask"].unsqueeze(-1)
+            else:
+                mask = token_mask
+        print("teacher_logits.shape, student_logits.shape")
+        print(teacher_logits.shape, student_logits.shape)
+        if vocab_parallel_group is not None:
+            # TP-distributed path (custom autograd for correct gradients)
+            per_token_kl = _DistributedForwardKL.apply(
+                student_logits,
+                teacher_logits,
+                vocab_parallel_group,
+            )
+        else:
+            # Non-distributed path
+            teacher_log_probs = torch.nn.functional.log_softmax(teacher_logits, dim=-1)
+            student_log_probs = torch.nn.functional.log_softmax(student_logits, dim=-1)
+            teacher_probs = teacher_log_probs.exp()
+            per_token_kl = (
+                teacher_probs * (teacher_log_probs - student_log_probs)
+            ).sum(dim=-1)
+
+        specdec_loss = masked_mean(
+            per_token_kl,
+            mask,
+            global_normalization_factor=global_valid_toks,
+        )
+
+        # ── 5. Combine losses ──
+        combined_loss = policy_loss + self.loss_weight * specdec_loss
+        metrics["specdec_loss"] = specdec_loss.detach().item()
+        # import pdb; pdb.set_trace()
+        return combined_loss, metrics
 
 
 class DistillationLossConfig(TypedDict):

@@ -15,7 +15,7 @@
 import os
 import time
 import warnings
-from typing import Any, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 import torch
 from megatron.bridge import AutoBridge
@@ -618,6 +618,73 @@ def _create_megatron_config(
     )
 
 
+def get_specdec_model(
+    model: list[MegatronModule],
+    specdec_config: dict,
+    ddp_config: DistributedDataParallelConfig,
+    use_torch_fsdp2: bool = False,
+    overlap_param_gather_with_optimizer_step: bool = False,
+    data_parallel_random_init: bool = True,
+    mixed_precision_wrapper: Callable | None = Float16Module,
+) -> MegatronModule | None:
+    # if not specdec_config.get("enabled", False):
+    #     return None
+    from dataclasses import replace
+
+    from megatron.bridge.models.model_provider import _ddp_wrap
+    from megatron.core import tensor_parallel
+    from megatron.core.parallel_state import is_pipeline_last_stage
+    from megatron.core.utils import get_model_config
+
+    from nemo_rl.models.specdec.llama_eagle3 import Eagle3ForCausalLM
+
+    if not is_pipeline_last_stage():
+        return None
+
+    # 1. Create the model (reuse main model's TransformerConfig)
+    specdec_model = Eagle3ForCausalLM(
+        config=replace(
+            model[0].config,
+            num_layers=specdec_config.get("num_layers", 1),
+            pipeline_model_parallel_size=1,
+            num_layers_in_first_pipeline_stage=None,
+            num_layers_in_last_pipeline_stage=None,
+        )
+    )
+
+    # 2. Set TP attributes on all params (mirrors get_model line 544-546)
+    for param in specdec_model.parameters():
+        tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
+
+    # 3. GPU allocation (mirrors get_model line 555-561)
+    model_config = get_model_config(specdec_model)
+    if (
+        not use_torch_fsdp2
+        and not model_config.use_cpu_initialization
+        and not getattr(model_config, "init_model_with_meta_device", False)
+    ):
+        specdec_model.cuda(torch.cuda.current_device())
+
+    # 4. Mixed precision wrap (mirrors get_model line 563-564)
+    if (model_config.fp16 or model_config.bf16) and mixed_precision_wrapper is not None:
+        specdec_model = mixed_precision_wrapper(model_config, specdec_model)
+
+    # 5. DDP/FSDP wrap (mirrors get_model line 569-577)
+    #    This is needed if you want the draft model's gradients
+    #    reduced across DP ranks (i.e., if you're training it).
+    #    If inference-only, you can skip this.
+    wrapped = _ddp_wrap(
+        [specdec_model],
+        data_parallel_random_init,
+        ddp_config,
+        overlap_param_gather_with_optimizer_step,
+        use_torch_fsdp2=use_torch_fsdp2,
+    )
+    specdec_model = wrapped[0]
+
+    return specdec_model
+
+
 def setup_model_and_optimizer(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -740,11 +807,20 @@ def setup_model_and_optimizer(
         pre_wrap_hook=pre_wrap_hook,
         mixed_precision_wrapper=mixed_precision_wrapper,
     )
+    specdec_model = get_specdec_model(
+        model=model,
+        specdec_config=policy_cfg.get("specdec", {}),
+        ddp_config=megatron_cfg.ddp,
+        use_torch_fsdp2=megatron_cfg.dist.use_torch_fsdp2,
+        overlap_param_gather_with_optimizer_step=megatron_cfg.optimizer.overlap_param_gather_with_optimizer_step,
+        data_parallel_random_init=megatron_cfg.rng.data_parallel_random_init,
+        mixed_precision_wrapper=mixed_precision_wrapper,
+    )
     if load_optimizer:
         optimizer, scheduler = setup_optimizer(
             optimizer_config=megatron_cfg.optimizer,
             scheduler_config=megatron_cfg.scheduler,
-            model=model,
+            model=model + ([specdec_model] if specdec_model is not None else []),
             use_gloo_process_groups=megatron_cfg.dist.use_gloo_process_groups,
         )
     else:
@@ -802,6 +878,7 @@ def setup_model_and_optimizer(
         scheduler,
         checkpointing_context,
         param_sync_func,
+        specdec_model,
     )
 
 

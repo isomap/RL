@@ -30,8 +30,13 @@ from megatron.core.transformer.moe.moe_utils import (
     reduce_aux_losses_tracker_across_ranks,
 )
 
-from nemo_rl.algorithms.loss_functions import LossFunction, SequencePackingLossWrapper
+from nemo_rl.algorithms.loss_functions import (
+    LossFunction,
+    SequencePackingLossWrapper,
+    SpecDecLossWrapper,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.specdec.hidden_capture import get_capture_context
 
 
 def _round_up_to_multiple(value: int, multiple: int) -> int:
@@ -53,6 +58,8 @@ def forward_step_arbitrary_loss(
     defer_fp32_logits: Optional[bool] = None,
     cp_normalize: bool = True,
     policy_cfg: Optional[dict] = None,
+    specdec_model=None,
+    specdec_config: Optional[dict] = None,
 ):
     """Forward training step with support for packed sequences and context parallelism.
 
@@ -103,7 +110,8 @@ def forward_step_arbitrary_loss(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
-    with straggler_timer:
+    capture = get_capture_context(model, specdec_config)
+    with straggler_timer, capture.capture_context():
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
@@ -131,6 +139,22 @@ def forward_step_arbitrary_loss(
             )
 
         loss_data = data_dict
+
+    hidden_states = capture.get_captured_states() if capture else None
+    if hidden_states and hidden_states.is_complete():
+        packing_kwargs = {}
+        if pack_sequences and packed_seq_params is not None:
+            packing_kwargs["cu_seqlens"] = packed_seq_params.cu_seqlens_q
+            packing_kwargs["cu_seqlens_padded"] = packed_seq_params.cu_seqlens_q_padded
+        loss_fn = SpecDecLossWrapper(
+            loss_fn=loss_fn,
+            specdec_model=specdec_model,
+            captured_hidden_states=hidden_states.hidden_states,
+            captured_inputs_embeds=hidden_states.inputs_embeds,
+            # loss_weight=specdec_config.get("loss_weight", 1.0),
+            sequence_parallel=model.config.sequence_parallel,
+            **packing_kwargs,
+        )
 
     loss_fn_wrapped = partial(
         loss_fn,

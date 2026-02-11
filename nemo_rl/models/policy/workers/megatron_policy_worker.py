@@ -251,6 +251,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
         self.scheduler = model_and_optimizer_state.scheduler
         self.checkpointing_context = model_and_optimizer_state.checkpointing_context
         param_sync_func = model_and_optimizer_state.param_sync_func
+        self.specdec_model = model_and_optimizer_state.specdec_model
 
         # Set the param sync function for the model if needed
         if param_sync_func is not None:
@@ -311,6 +312,8 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
     ) -> dict[str, Any]:
         """Train the policy on a batch of data with a given loss function."""
         self.model.zero_grad_buffer()
+        if self.specdec_model is not None:
+            self.specdec_model.zero_grad_buffer()
         if hasattr(self.model, "inference_params"):
             self.model.inference_params = None
 
@@ -344,7 +347,11 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
 
         with ctx:
             forward_step = partial(
-                forward_step_arbitrary_loss, loss_fn=loss_fn, policy_cfg=self.cfg
+                forward_step_arbitrary_loss,
+                loss_fn=loss_fn,
+                policy_cfg=self.cfg,
+                specdec_model=self.specdec_model,
+                # specdec_config=self.cfg.get("policy", {}).get("generation", {}).get("speculative_config", None)
             )
             all_mb_metrics = []
             losses = []
@@ -380,28 +387,48 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 while rerun_state_machine.should_run_forward_backward(data_iterator):
                     # Set grad to zero.
                     self.model.zero_grad_buffer()
+                    if self.specdec_model is not None:
+                        self.specdec_model.zero_grad_buffer()
                     self.optimizer.zero_grad()
 
                     # Forward pass.
+                    # Wrap with specdec no_sync so that the specdec model's
+                    # DDP backward hooks don't call register_grad_ready()
+                    # during individual microbatches (Megatron's pipeline only
+                    # manages no_sync for the main model).  We manually sync
+                    # the specdec gradients after the full forward-backward.
                     forward_backward_func = get_forward_backward_func()
-                    losses_reduced = forward_backward_func(
-                        forward_step_func=partial(
-                            forward_step,
-                            self.mcore_state,
-                            global_valid_seqs,
-                            global_valid_toks,
-                            pack_sequences=self.cfg["sequence_packing"]["enabled"],
-                            defer_fp32_logits=self.defer_fp32_logits,
-                        ),
-                        data_iterator=data_iterator,
-                        model=self.model,
-                        num_microbatches=num_microbatches,
-                        seq_length=padded_seq_length,
-                        micro_batch_size=mbs,
-                        decoder_seq_length=padded_seq_length,
-                        forward_only=eval_mode,
-                        do_not_average_loss=True,
+                    specdec_no_sync = (
+                        self.specdec_model.no_sync()
+                        if self.specdec_model is not None
+                        else nullcontext()
                     )
+                    with specdec_no_sync:
+                        losses_reduced = forward_backward_func(
+                            forward_step_func=partial(
+                                forward_step,
+                                self.mcore_state,
+                                global_valid_seqs,
+                                global_valid_toks,
+                                pack_sequences=self.cfg["sequence_packing"]["enabled"],
+                                defer_fp32_logits=self.defer_fp32_logits,
+                            ),
+                            data_iterator=data_iterator,
+                            model=self.model,
+                            num_microbatches=num_microbatches,
+                            seq_length=padded_seq_length,
+                            micro_batch_size=mbs,
+                            decoder_seq_length=padded_seq_length,
+                            forward_only=eval_mode,
+                            do_not_average_loss=True,
+                        )
+
+                    # Synchronise specdec model gradients across DP ranks.
+                    # no_sync() suppressed overlapped grad-reduce during the
+                    # microbatch loop; trigger it explicitly now.
+                    if self.specdec_model is not None and not eval_mode:
+                        self.specdec_model.start_grad_sync()
+                        self.specdec_model.finish_grad_sync()
 
                 # Empty unused memory.
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
