@@ -1,0 +1,67 @@
+# GRPO math training: Qwen3-8B post-trained (1 node, 8 GPUs, DFW)
+defaults: ../../../../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  val_period: 20
+  val_at_start: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+  token_level_loss: true
+
+checkpointing:
+  checkpoint_dir: experiments/rl_baselines/math/qwen3_8b/results
+  save_period: 20
+  keep_top_k: 3
+
+policy:
+  model_name: Qwen/Qwen3-8B
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 40960
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size}, 2}
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    sequence_parallel: true
+    defer_fp32_logits: true
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-07
+      weight_decay: 0.1
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+
+data:
+  max_input_seq_length: 4096
+
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: "hf_math_verify"
+
+logger:
+  log_dir: experiments/rl_baselines/math/qwen3_8b/logs
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: rl-baselines
+    name: grpo-math-qwen3-8b-1n8g
+
+cluster:
+  gpus_per_node: 8
+  num_nodes: 1

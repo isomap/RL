@@ -1,0 +1,101 @@
+# GRPO multitask training: qwen3_32b_base (8 nodes, 4 GPUs)
+defaults: ../../../../examples/nemo_gym/grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  max_rollout_turns: 1
+  val_period: 10
+  val_at_start: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+
+checkpointing:
+  checkpoint_dir: experiments/rl_baselines/multitask/qwen3_32b_base/results
+  save_period: 10
+  keep_top_k: 3
+
+policy:
+  model_name: Qwen/Qwen3-32B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  logprob_chunk_size: null
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: true
+    defer_fp32_logits: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    empty_unused_memory_level: 1
+    optimizer:
+      lr: 3.0e-07
+      min_lr: 3.0e-08
+      weight_decay: 0.01
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+      http_server_serving_chat_kwargs: null
+
+
+data:
+  train_jsonl_fpath: null
+  validation_jsonl_fpath: null
+  shuffle: true
+  num_workers: 0
+
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  nemo_gym:
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    - resources_servers/code_gen/configs/code_gen.yaml
+    - resources_servers/mcqa/configs/mcqa.yaml
+    - resources_servers/instruction_following/configs/instruction_following.yaml
+    - resources_servers/structured_outputs/configs/structured_outputs_json.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+    code_gen:
+      resources_servers:
+        code_gen:
+          num_processes: ${mul:64, ${cluster.num_nodes}}
+
+logger:
+  log_dir: experiments/rl_baselines/multitask/qwen3_32b_base/logs
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: rl-baselines
+    name: grpo-multitask-qwen3-32b-base-8n4g
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

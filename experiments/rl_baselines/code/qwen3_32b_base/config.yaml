@@ -1,0 +1,75 @@
+# GRPO code training: Qwen3-32B-Base (8 nodes, 4 GPUs, HSG)
+defaults: ../../../../examples/configs/grpo_math_1B.yaml
+
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 16
+  val_period: 10
+  val_at_start: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0
+  use_importance_sampling_correction: true
+  token_level_loss: true
+
+checkpointing:
+  checkpoint_dir: experiments/rl_baselines/code/qwen3_32b_base/results
+  save_period: 10
+  keep_top_k: 3
+
+policy:
+  model_name: Qwen/Qwen3-32B-Base
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 32768
+  dtensor_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    activation_checkpointing: true
+    tensor_model_parallel_size: 4
+    pipeline_model_parallel_size: 2
+    context_parallel_size: 1
+    sequence_parallel: true
+    defer_fp32_logits: true
+    apply_rope_fusion: true
+    bias_activation_fusion: true
+    optimizer:
+      lr: 3.0e-07
+      min_lr: 3.0e-08
+      weight_decay: 0.01
+      use_precision_aware_optimizer: true
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 3.0e-08
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 4
+      gpu_memory_utilization: 0.7
+
+data:
+  default:
+    processor: null
+    env_name: "code"
+  max_input_seq_length: 4096
+
+env:
+  code:
+    num_workers: 16
+
+logger:
+  log_dir: experiments/rl_baselines/code/qwen3_32b_base/logs
+  wandb_enabled: true
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    project: rl-baselines
+    name: grpo-code-qwen3-32b-base-8n4g
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8

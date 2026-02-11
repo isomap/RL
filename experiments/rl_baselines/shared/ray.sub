@@ -1,0 +1,29 @@
+#!/bin/bash
+#SBATCH --exclusive
+#SBATCH --mem=0
+#SBATCH --dependency=singleton
+
+# RL Baselines SLURM submission template.
+# Override SBATCH directives via command line:
+#   sbatch --nodes=4 --gpus-per-node=8 --account=ACCOUNT --partition=batch_long \
+#          --time=8:00:00 --job-name=grpo-math-qwen3-8b \
+#          experiments/rl_baselines/shared/ray.sub
+
+set -eoux pipefail
+
+# Required env vars (set by run.sh or sbatch overrides):
+#   CONFIG_PATH - path to GRPO training config YAML
+#   CONTAINER   - container image URI
+#   MOUNTS      - container mount string
+
+CONFIG_PATH=${CONFIG_PATH:?CONFIG_PATH must be set}
+CONTAINER=${CONTAINER:?CONTAINER must be set}
+MOUNTS=${MOUNTS:-""}
+GPUS_PER_NODE=${GPUS_PER_NODE:-8}
+
+COMMAND="uv run python examples/run_grpo.py --config $CONFIG_PATH"
+
+export CONTAINER MOUNTS COMMAND GPUS_PER_NODE
+
+# Delegate to the main ray.sub cluster bringup script
+exec bash ray.sub

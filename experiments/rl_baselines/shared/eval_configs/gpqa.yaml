@@ -1,0 +1,14 @@
+defaults: "../../../../examples/configs/evals/eval.yaml"
+
+generation:
+  model_name: null  # Override: generation.model_name=<checkpoint_path>
+  vllm_cfg:
+    max_model_len: 8192
+
+data:
+  prompt_file: "examples/prompts/gpqa.txt"
+  dataset_name: "gpqa"
+
+env:
+  math:
+    verifier_type: "multilingual_multichoice"
