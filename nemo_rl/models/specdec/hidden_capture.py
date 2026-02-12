@@ -30,7 +30,7 @@ Based on vLLM's Eagle3 implementation pattern:
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import ContextManager, Dict, List, Optional, Tuple
 
@@ -496,14 +496,14 @@ def get_capture_context(
             )
     """
     # Return no-op context if specdec is disabled
-    # if not specdec_config or not specdec_config.get("enabled", False):
-    #     return nullcontext(), None
+    if not specdec_config or not specdec_config.get("enabled", False):
+        return nullcontext(), None
 
-    # # Create capture instance
-    # aux_indices = specdec_config.get("aux_layer_indices", None)
+    # Create capture instance
+    aux_indices = specdec_config.get("aux_layer_indices", None)
     capture = HiddenStateCapture(
         model=model,
-        # aux_layer_indices=tuple(aux_indices) if aux_indices else None,
+        aux_layer_indices=tuple(aux_indices) if aux_indices else None,
     )
 
-    return capture
+    return capture.capture_context(), capture

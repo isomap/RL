@@ -110,8 +110,8 @@ def forward_step_arbitrary_loss(
     if defer_fp32_logits:
         additional_kwargs["fp32_output"] = False
 
-    capture = get_capture_context(model, specdec_config)
-    with straggler_timer, capture.capture_context():
+    capture_ctx, capture = get_capture_context(model, specdec_config)
+    with straggler_timer, capture_ctx:
         output_tensor = model(
             input_ids=input_ids_cp_sharded,
             position_ids=position_ids,
@@ -151,7 +151,7 @@ def forward_step_arbitrary_loss(
             specdec_model=specdec_model,
             captured_hidden_states=hidden_states.hidden_states,
             captured_inputs_embeds=hidden_states.inputs_embeds,
-            # loss_weight=specdec_config.get("loss_weight", 1.0),
+            loss_weight=specdec_config.get("loss_weight", 1.0),
             sequence_parallel=model.config.sequence_parallel,
             **packing_kwargs,
         )

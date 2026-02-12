@@ -627,8 +627,8 @@ def get_specdec_model(
     data_parallel_random_init: bool = True,
     mixed_precision_wrapper: Callable | None = Float16Module,
 ) -> MegatronModule | None:
-    # if not specdec_config.get("enabled", False):
-    #     return None
+    if not specdec_config.get("enabled", False):
+        return None
     from dataclasses import replace
 
     from megatron.bridge.models.model_provider import _ddp_wrap
@@ -636,7 +636,11 @@ def get_specdec_model(
     from megatron.core.parallel_state import is_pipeline_last_stage
     from megatron.core.utils import get_model_config
 
-    from nemo_rl.models.specdec.llama_eagle3 import Eagle3ForCausalLM
+    from nemo_rl.models.specdec.llama_eagle3 import (
+        Eagle3ForCausalLM,
+        create_config_from_hf,
+        load_hf_weights_to_eagle,
+    )
 
     if not is_pipeline_last_stage():
         return None
@@ -651,6 +655,50 @@ def get_specdec_model(
             num_layers_in_last_pipeline_stage=None,
         )
     )
+
+    # 1b. Load pre-trained HF weights if a draft model path is provided
+    draft_model_path = specdec_config.get("draft_model_path")
+    if draft_model_path:
+        from pathlib import Path
+
+        from transformers import AutoConfig
+
+        hf_config = AutoConfig.from_pretrained(draft_model_path)
+
+        # Try safetensors first, fall back to pytorch_model.bin
+        local_dir = Path(draft_model_path)
+        if (local_dir / "model.safetensors").exists():
+            from safetensors.torch import load_file as load_safetensors
+
+            hf_state_dict = load_safetensors(str(local_dir / "model.safetensors"))
+        elif (local_dir / "pytorch_model.bin").exists():
+            hf_state_dict = torch.load(
+                str(local_dir / "pytorch_model.bin"),
+                map_location="cpu",
+                weights_only=True,
+            )
+        else:
+            from huggingface_hub import hf_hub_download
+
+            try:
+                local_path = hf_hub_download(draft_model_path, "model.safetensors")
+                from safetensors.torch import load_file as load_safetensors
+
+                hf_state_dict = load_safetensors(local_path)
+            except Exception:
+                local_path = hf_hub_download(draft_model_path, "pytorch_model.bin")
+                hf_state_dict = torch.load(
+                    local_path, map_location="cpu", weights_only=True
+                )
+
+        eagle_config = create_config_from_hf(hf_config)
+        missing, unexpected = load_hf_weights_to_eagle(
+            specdec_model, hf_state_dict, eagle_config
+        )
+        if missing:
+            print(f"[specdec] Missing keys after HF weight load: {missing}")
+        if unexpected:
+            print(f"[specdec] Unexpected keys after HF weight load: {unexpected}")
 
     # 2. Set TP attributes on all params (mirrors get_model line 544-546)
     for param in specdec_model.parameters():
@@ -860,6 +908,37 @@ def setup_model_and_optimizer(
         )
         print("Checkpoint loaded")
     torch.distributed.barrier()
+
+    # Copy lm_head weights from target model to specdec model.
+    # Must happen after checkpoint loading so target weights are materialized.
+    if specdec_model is not None:
+        target_model_unwrapped = model[0]
+        while hasattr(target_model_unwrapped, "module"):
+            target_model_unwrapped = target_model_unwrapped.module
+
+        # Get the output projection weight. When tie_word_embeddings=True,
+        # output_layer.weight is None (skip_weight_param_allocation) and
+        # the shared weight lives in embedding.word_embeddings.weight.
+        target_lm_weight = None
+        if hasattr(target_model_unwrapped, "shared_embedding_or_output_weight"):
+            target_lm_weight = (
+                target_model_unwrapped.shared_embedding_or_output_weight()
+            )
+        elif hasattr(target_model_unwrapped, "output_layer"):
+            target_lm_weight = target_model_unwrapped.output_layer.weight
+
+        if target_lm_weight is not None:
+            eagle_raw = specdec_model
+            while hasattr(eagle_raw, "module"):
+                eagle_raw = eagle_raw.module
+            if eagle_raw.lm_head.weight.shape == target_lm_weight.shape:
+                eagle_raw.lm_head.weight.data.copy_(target_lm_weight.data)
+                print("[specdec] Copied lm_head weights from target model")
+            else:
+                print(
+                    f"[specdec] Shape mismatch: eagle={eagle_raw.lm_head.weight.shape}"
+                    f" vs target={target_lm_weight.shape}"
+                )
 
     # Set the param sync function for the model
     param_sync_func = None

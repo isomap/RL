@@ -489,7 +489,7 @@ def load_hf_weights_to_eagle(
         if "fc.weight" in hf_key:
             new_state["model.fc.weight"] = hf_weight
             continue
-        if "norm.weight" in hf_key and "layernorm" not in hf_key:
+        if hf_key == "norm.weight":
             new_state["model.norm.weight"] = hf_weight
             continue
         # lm_head is reused from the target model — skip.
@@ -542,6 +542,121 @@ def load_hf_weights_to_eagle(
 
     missing, unexpected = model.load_state_dict(new_state, strict=False)
     return missing, unexpected
+
+
+# =============================================================================
+# Weight Export: Megatron -> HuggingFace
+# =============================================================================
+
+
+def save_eagle_weights_to_hf(
+    model: Eagle3ForCausalLM,
+    config: TransformerConfig,
+) -> Dict[str, Tensor]:
+    """Export Megatron Eagle weights to HuggingFace state dict format.
+
+    Reverse of ``load_hf_weights_to_eagle``. Splits fused QKV and gate+up
+    projections back into separate HF-style tensors.
+    """
+    # Unwrap DDP / Float16Module wrappers
+    raw_model = model
+    while hasattr(raw_model, "module"):
+        raw_model = raw_model.module
+
+    src_state = raw_model.state_dict()
+    hf_state: Dict[str, Tensor] = {}
+
+    q_dim = config.num_attention_heads * config.kv_channels
+    kv_dim = config.num_query_groups * config.kv_channels
+    ffn = config.ffn_hidden_size
+
+    for key, weight in src_state.items():
+        # Top-level modules: strip "model." prefix
+        if key == "model.fc.weight":
+            hf_state["fc.weight"] = weight
+        elif key == "model.norm.weight":
+            hf_state["norm.weight"] = weight
+        elif key == "lm_head.weight":
+            hf_state["lm_head.weight"] = weight
+
+        # Layer norms
+        elif key == "model.layer.input_layernorm.weight":
+            hf_state["midlayer.input_layernorm.weight"] = weight
+        elif key == "model.layer.hidden_norm.weight":
+            hf_state["midlayer.hidden_norm.weight"] = weight
+        elif key == "model.layer.pre_mlp_layernorm.weight":
+            hf_state["midlayer.post_attention_layernorm.weight"] = weight
+
+        # Split fused QKV -> separate Q, K, V
+        elif key == "model.layer.self_attention.linear_qkv.weight":
+            q, k, v = weight.split([q_dim, kv_dim, kv_dim], dim=0)
+            hf_state["midlayer.self_attn.q_proj.weight"] = q
+            hf_state["midlayer.self_attn.k_proj.weight"] = k
+            hf_state["midlayer.self_attn.v_proj.weight"] = v
+
+        # Output projection
+        elif key == "model.layer.self_attention.linear_proj.weight":
+            hf_state["midlayer.self_attn.o_proj.weight"] = weight
+
+        # Split fused gate+up -> separate gate, up
+        elif key == "model.layer.mlp.linear_fc1.weight":
+            gate, up = weight.split([ffn, ffn], dim=0)
+            hf_state["midlayer.mlp.gate_proj.weight"] = gate
+            hf_state["midlayer.mlp.up_proj.weight"] = up
+
+        # Down projection
+        elif key == "model.layer.mlp.linear_fc2.weight":
+            hf_state["midlayer.mlp.down_proj.weight"] = weight
+
+    return hf_state
+
+
+def save_eagle_to_hf_checkpoint(
+    model: Eagle3ForCausalLM,
+    config: TransformerConfig,
+    output_dir: str,
+    target_model_config: Optional[Dict] = None,
+) -> None:
+    """Save Megatron Eagle model as a HuggingFace-compatible checkpoint.
+
+    Writes ``model.safetensors`` and ``config.json`` to *output_dir*,
+    compatible with vLLM's ``speculative_model`` loading.
+
+    Args:
+        model: Trained Megatron Eagle3 model.
+        config: TransformerConfig used for the Eagle model.
+        output_dir: Directory to write the checkpoint to.
+        target_model_config: Optional dict with target model config values
+            (vocab_size, draft_vocab_size, etc.) to include in config.json.
+    """
+    import json
+    from pathlib import Path
+
+    from safetensors.torch import save_file
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    hf_state = save_eagle_weights_to_hf(model, config)
+    save_file(hf_state, str(out / "model.safetensors"))
+
+    # Build config.json
+    cfg = {
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLMEagle3"],
+        "hidden_size": config.hidden_size,
+        "num_hidden_layers": 1,
+        "num_attention_heads": config.num_attention_heads,
+        "num_key_value_heads": config.num_query_groups,
+        "intermediate_size": config.ffn_hidden_size,
+        "rms_norm_eps": config.layernorm_epsilon,
+        "torch_dtype": "bfloat16",
+    }
+    if target_model_config:
+        cfg.update(target_model_config)
+
+    with open(out / "config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
 
 
 # =============================================================================

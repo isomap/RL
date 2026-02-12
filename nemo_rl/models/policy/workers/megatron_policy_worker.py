@@ -351,7 +351,7 @@ class MegatronPolicyWorker(AbstractPolicyWorker, ColocatablePolicyInterface):
                 loss_fn=loss_fn,
                 policy_cfg=self.cfg,
                 specdec_model=self.specdec_model,
-                # specdec_config=self.cfg.get("policy", {}).get("generation", {}).get("speculative_config", None)
+                specdec_config=self.cfg.get("specdec", {}),
             )
             all_mb_metrics = []
             losses = []

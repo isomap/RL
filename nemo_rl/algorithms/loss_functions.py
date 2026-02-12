@@ -1160,8 +1160,6 @@ class SpecDecLossWrapper:
                 mask = token_mask * data["sample_mask"].unsqueeze(-1)
             else:
                 mask = token_mask
-        print("teacher_logits.shape, student_logits.shape")
-        print(teacher_logits.shape, student_logits.shape)
         if vocab_parallel_group is not None:
             # TP-distributed path (custom autograd for correct gradients)
             per_token_kl = _DistributedForwardKL.apply(
@@ -1187,7 +1185,6 @@ class SpecDecLossWrapper:
         # ── 5. Combine losses ──
         combined_loss = policy_loss + self.loss_weight * specdec_loss
         metrics["specdec_loss"] = specdec_loss.detach().item()
-        # import pdb; pdb.set_trace()
         return combined_loss, metrics
 
 
