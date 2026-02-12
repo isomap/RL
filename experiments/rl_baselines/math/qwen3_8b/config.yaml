@@ -32,6 +32,7 @@ policy:
     activation_checkpointing: true
     tensor_model_parallel_size: 4
     sequence_parallel: true
+    context_parallel_size: 4
     defer_fp32_logits: true
     optimizer:
       lr: 1.0e-06
@@ -60,8 +61,8 @@ logger:
   monitor_gpus: true
   wandb:
     project: rl-baselines
-    name: grpo-math-qwen3-8b-1n8g
+    name: grpo-math-qwen3-8b-4n8g
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
+  num_nodes: 4

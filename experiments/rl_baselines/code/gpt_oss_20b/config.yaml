@@ -55,10 +55,10 @@ policy:
       tensor_parallel_size: 2
 
 data:
+  max_input_seq_length: 4096
   default:
     processor: null
     env_name: "code"
-  max_input_seq_length: 4096
 
 env:
   code:

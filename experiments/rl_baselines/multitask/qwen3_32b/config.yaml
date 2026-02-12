@@ -36,7 +36,7 @@ policy:
     tensor_model_parallel_size: 4
     pipeline_model_parallel_size: 2
     expert_model_parallel_size: 1
-    context_parallel_size: 1
+    context_parallel_size: 4
     sequence_parallel: true
     defer_fp32_logits: true
     apply_rope_fusion: true
@@ -94,8 +94,8 @@ logger:
   monitor_gpus: true
   wandb:
     project: rl-baselines
-    name: grpo-multitask-qwen3-32b-8n4g
+    name: grpo-multitask-qwen3-32b-16n4g
 
 cluster:
   gpus_per_node: 4
-  num_nodes: 8
+  num_nodes: 16

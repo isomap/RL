@@ -103,7 +103,7 @@ logger:
   monitor_gpus: true
   wandb:
     project: rl-baselines
-    name: grpo-multitask-gpt-oss-120b-32n4g
+    name: grpo-multitask-gptoss-120b-32n4g
 
 cluster:
   gpus_per_node: 4

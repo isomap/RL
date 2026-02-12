@@ -64,10 +64,10 @@ policy:
       gpu_memory_utilization: 0.7
 
 data:
+  max_input_seq_length: 4096
   default:
     processor: null
     env_name: "code"
-  max_input_seq_length: 4096
 
 env:
   code:

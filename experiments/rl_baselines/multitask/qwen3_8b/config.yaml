@@ -93,8 +93,8 @@ logger:
   monitor_gpus: true
   wandb:
     project: rl-baselines
-    name: grpo-multitask-qwen3-8b-1n8g
+    name: grpo-multitask-qwen3-8b-4n8g
 
 cluster:
   gpus_per_node: 8
-  num_nodes: 1
+  num_nodes: 4

@@ -10,7 +10,7 @@ CONTAINER=${CONTAINER:?Set CONTAINER env var} \
 MOUNTS=${MOUNTS:-"$REPO_DIR:$REPO_DIR"} \
 GPUS_PER_NODE=8 \
 sbatch \
-    --nodes=1 \
+    --nodes=4 \
     --account=${ACCOUNT:?Set ACCOUNT} \
     --partition=${PARTITION:-batch_long} \
     --time=${TIME:-8:00:00} \

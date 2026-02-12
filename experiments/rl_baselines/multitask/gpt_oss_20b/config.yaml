@@ -97,7 +97,7 @@ logger:
   monitor_gpus: true
   wandb:
     project: rl-baselines
-    name: grpo-multitask-gpt-oss-20b-8n8g
+    name: grpo-multitask-gptoss-20b-8n8g
 
 cluster:
   gpus_per_node: 8

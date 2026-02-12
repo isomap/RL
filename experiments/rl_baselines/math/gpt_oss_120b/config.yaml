@@ -1,5 +1,4 @@
 # GRPO math training: GPT-OSS 120B (32 nodes, 4 GPUs, HSG)
-# NOTE: model_name TBD - update when internal path is available
 defaults: ../../../../examples/configs/grpo_math_1B.yaml
 
 grpo:
@@ -20,7 +19,7 @@ checkpointing:
   checkpoint_must_save_by: "00:06:00:00"
 
 policy:
-  model_name: TBD  # Update with internal path
+  model_name: openai/gpt-oss-120b
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 4096  # TBD: update when model max context is known
