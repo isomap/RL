@@ -16,4 +16,5 @@ sbatch \
     --time=4:00:00 \
     --exclusive \
     --mem=0 \
+    --gres=gpu:8 \
     ray.sub
